@@ -1,7 +1,6 @@
 import os, sqlite3, hashlib, hmac, secrets, json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from urllib.parse import urlparse
 
 from fastapi import FastAPI, Request, Form, HTTPException
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
@@ -14,7 +13,10 @@ from google.auth.transport.requests import Request as GoogleRequest
 
 APP_DIR = Path(__file__).parent
 DB_PATH = os.getenv("DATABASE_PATH", str(APP_DIR / "liveconnect.db"))
+Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
 SECRET_KEY = os.getenv("SECRET_KEY", "development-only-change-this-secret")
+if os.getenv("RENDER") and SECRET_KEY == "development-only-change-this-secret":
+    raise RuntimeError("Set a strong SECRET_KEY in the deployment environment.")
 BASE_URL = os.getenv("BASE_URL", "http://localhost:10000").rstrip("/")
 CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
 CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
@@ -24,8 +26,10 @@ app = FastAPI(title="LiveConnect Creator Studio", version="1.0.0")
 app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY, same_site="lax", https_only=BASE_URL.startswith("https://"))
 
 def db():
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH, timeout=20)
     con.row_factory = sqlite3.Row
+    con.execute("PRAGMA foreign_keys=ON")
+    con.execute("PRAGMA busy_timeout=20000")
     return con
 
 def init_db():
@@ -105,6 +109,7 @@ def register(request: Request, email: str = Form(...), password: str = Form(...)
         with db() as con:
             cur = con.execute("INSERT INTO users(email,salt,password_hash,created_at) VALUES(?,?,?,?)",
                               (email, salt, digest, datetime.now(timezone.utc).isoformat()))
+            request.session.clear()
             request.session["uid"] = cur.lastrowid
     except sqlite3.IntegrityError:
         raise HTTPException(409, "An account with that email already exists.")
@@ -119,6 +124,7 @@ def login(request: Request, email: str = Form(...), password: str = Form(...)):
     _, digest = hash_password(password, row["salt"])
     if not hmac.compare_digest(digest, row["password_hash"]):
         raise HTTPException(401, "Email or password is incorrect.")
+    request.session.clear()
     request.session["uid"] = row["id"]
     return {"ok": True, "email": row["email"]}
 
@@ -185,6 +191,8 @@ async def create_broadcast(request: Request):
     title = str(body.get("title", "LiveConnect Broadcast")).strip()[:100]
     description = str(body.get("description", "Live stream created with LiveConnect")).strip()[:5000]
     privacy = body.get("privacy", "unlisted")
+    if not title:
+        raise HTTPException(400, "Broadcast title is required.")
     if privacy not in ("public", "unlisted", "private"):
         raise HTTPException(400, "Invalid privacy setting.")
     try:
@@ -213,8 +221,8 @@ async def create_broadcast(request: Request):
                 "obs_note":"Enter the RTMP URL as Server and the stream key as Stream Key in OBS. Keep the key private."}
     except HTTPException:
         raise
-    except Exception as exc:
-        raise HTTPException(502, "YouTube could not create the broadcast. Check channel live-stream eligibility and YouTube API access. Details: " + str(exc)[:350])
+    except Exception:
+        raise HTTPException(502, "YouTube could not create the broadcast. Check that live streaming is enabled for your channel, YouTube Data API v3 is enabled, and the connected Google account has the required permissions.")
 
 @app.get("/api/youtube/broadcasts")
 def broadcasts(request: Request):

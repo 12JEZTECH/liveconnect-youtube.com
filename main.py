@@ -17,7 +17,7 @@ Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
 SECRET_KEY = os.getenv("SECRET_KEY", "development-only-change-this-secret")
 if os.getenv("RENDER") and SECRET_KEY == "development-only-change-this-secret":
     raise RuntimeError("Set a strong SECRET_KEY in the deployment environment.")
-BASE_URL = os.getenv("BASE_URL", "http://localhost:10000").rstrip("/")
+BASE_URL = (os.getenv("BASE_URL") or os.getenv("RENDER_EXTERNAL_URL") or "http://localhost:10000").rstrip("/")
 CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
 CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
 SCOPES = ["openid", "https://www.googleapis.com/auth/userinfo.email", "https://www.googleapis.com/auth/youtube.force-ssl"]

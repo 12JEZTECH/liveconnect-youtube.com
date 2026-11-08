@@ -66,10 +66,9 @@ Google may require OAuth app verification before unrestricted public use. The Yo
 The repository includes `render.yaml` and a Dockerfile. In Render:
 
 1. Choose **New → Blueprint** and select this GitHub repository, or create a Docker web service from the repository.
-2. Set `BASE_URL` to the HTTPS URL assigned by Render.
-3. Add `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` as secret environment variables.
-4. Add the exact Render callback URL to the Google OAuth client.
-5. Deploy and verify `/health` returns JSON with status `ok`.
+2. Add `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` as secret environment variables. The app reads Render's `RENDER_EXTERNAL_URL` automatically for its OAuth callback and secure cookies; set `BASE_URL` only if using a custom domain.
+3. After the first service is created, copy its HTTPS URL and add `https://YOUR-RENDER-DOMAIN/auth/google/callback` to the Google OAuth client's Authorized redirect URIs.
+4. Deploy and verify `/health` returns JSON with status `ok`.
 
 The Blueprint uses a Starter instance and a 1 GB persistent disk as a starting point. The persistent disk means the service must remain single-instance; do not scale it horizontally while using SQLite. The Google OAuth client secret and client ID are intentionally marked as values you must supply in Render. Never commit real credentials to GitHub.
 

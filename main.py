@@ -206,14 +206,22 @@ async def create_broadcast(request: Request):
                   "status":{"privacyStatus":privacy},
                   "contentDetails":{"enableAutoStart":False,"enableAutoStop":False}}
         ).execute()
-        stream = yt.liveStreams().insert(
-            part="snippet,cdn,contentDetails,status",
-            body={"snippet":{"title":title + " - LiveConnect ingest"},
-                  "cdn":{"ingestionType":"rtmp","resolution":"variable","frameRate":"variable"},
-                  "contentDetails":{"isReusable":False}}
-        ).execute()
-        yt.liveBroadcasts().bind(part="id,contentDetails", id=broadcast["id"],
-                                 streamId=stream["id"]).execute()
+        try:
+            stream = yt.liveStreams().insert(
+                part="snippet,cdn,contentDetails,status",
+                body={"snippet":{"title":title + " - LiveConnect ingest"},
+                      "cdn":{"ingestionType":"rtmp","resolution":"variable","frameRate":"variable"},
+                      "contentDetails":{"isReusable":False}}
+            ).execute()
+            yt.liveBroadcasts().bind(part="id,contentDetails", id=broadcast["id"],
+                                     streamId=stream["id"]).execute()
+        except Exception:
+            # Remove an unbound scheduled broadcast if stream setup fails.
+            try:
+                yt.liveBroadcasts().delete(id=broadcast["id"]).execute()
+            except Exception:
+                pass
+            raise
         ingest = stream.get("cdn", {}).get("ingestionInfo", {})
         return {"ok":True,"broadcast_id":broadcast["id"],"watch_url":"https://www.youtube.com/watch?v="+broadcast["id"],
                 "rtmp_url":ingest.get("ingestionAddress"),"stream_key":ingest.get("streamName"),

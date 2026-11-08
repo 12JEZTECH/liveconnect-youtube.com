@@ -17,7 +17,7 @@ This release creates and binds YouTube Live broadcasts. **OBS (or another RTMP e
 
 Remote phone-to-browser WebRTC relay, TURN infrastructure, team workspaces, password reset/email verification, billing, and a production-grade persistent database are not included in this first release.
 
-The default SQLite database is suitable for local testing only. Render containers have ephemeral filesystems unless a persistent disk is configured. For production, move users and OAuth tokens to managed PostgreSQL, encrypt stored OAuth refresh tokens, configure backups, add rate limiting and account recovery, and use HTTPS.
+The Render Blueprint now mounts a persistent disk at `/var/data` and stores the SQLite database at `/var/data/liveconnect.db`, so account and OAuth-token rows survive ordinary deploys. This is a small single-instance starter configuration, not a high-availability database. For a larger production service, migrate to managed PostgreSQL, encrypt stored OAuth refresh tokens, configure backups, add rate limiting and account recovery, and use HTTPS.
 
 ## Run locally (Windows PowerShell)
 
@@ -71,7 +71,7 @@ The repository includes `render.yaml` and a Dockerfile. In Render:
 4. Add the exact Render callback URL to the Google OAuth client.
 5. Deploy and verify `/health` returns JSON with status `ok`.
 
-The Blueprint uses a Starter instance as a starting point. Select a plan suitable for your traffic. Do not use this SQLite configuration for production user data.
+The Blueprint uses a Starter instance and a 1 GB persistent disk as a starting point. The persistent disk means the service must remain single-instance; do not scale it horizontally while using SQLite. The Google OAuth client secret and client ID are intentionally marked as values you must supply in Render. Never commit real credentials to GitHub.
 
 ## OBS workflow
 

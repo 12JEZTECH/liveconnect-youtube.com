@@ -1,9 +1,9 @@
-import os, sqlite3, hashlib, hmac, secrets, json
+import os, sqlite3, hashlib, hmac, secrets, json, subprocess, tempfile, mimetypes
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from fastapi import FastAPI, Request, Form, HTTPException
-from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
+from fastapi import FastAPI, Request, Form, HTTPException, UploadFile, File
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.sessions import SessionMiddleware
 from google_auth_oauthlib.flow import Flow
@@ -32,7 +32,16 @@ def db():
     con.execute("PRAGMA busy_timeout=20000")
     return con
 
-def init_db():
+def         con.execute("""CREATE TABLE IF NOT EXISTS media_assets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, name TEXT NOT NULL,
+            mime_type TEXT NOT NULL, data BLOB NOT NULL, size INTEGER NOT NULL, created_at TEXT NOT NULL,
+            FOREIGN KEY(user_id) REFERENCES users(id))""")
+        con.execute("""CREATE TABLE IF NOT EXISTS creator_records (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, kind TEXT NOT NULL,
+            title TEXT NOT NULL, payload TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+            FOREIGN KEY(user_id) REFERENCES users(id))""")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_creator_user_kind ON creator_records(user_id,kind)")
+init_db():
     with db() as con:
         con.execute("""CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT UNIQUE NOT NULL,
@@ -239,7 +248,118 @@ def broadcasts(request: Request):
     yt = build("youtube", "v3", credentials=creds, cache_discovery=False)
     return yt.liveBroadcasts().list(part="snippet,status", broadcastStatus="upcoming", maxResults=20).execute().get("items", [])
 
-@app.get("/api/config")
+
+def utc_now():
+    return datetime.now(timezone.utc).isoformat()
+
+def record_out(row):
+    return {"id":row["id"],"kind":row["kind"],"title":row["title"],"payload":json.loads(row["payload"]),"created_at":row["created_at"],"updated_at":row["updated_at"]}
+
+@app.get("/api/creator/records")
+def list_creator_records(request:Request, kind:str=""):
+    user=require_user(request)
+    with db() as con:
+        rows=con.execute("SELECT * FROM creator_records WHERE user_id=? AND (?='' OR kind=?) ORDER BY updated_at DESC",(user["id"],kind,kind)).fetchall()
+    return [record_out(r) for r in rows]
+
+@app.post("/api/creator/records")
+async def save_creator_record(request:Request):
+    user=require_user(request); body=await request.json(); kind=str(body.get("kind","")).lower(); title=str(body.get("title","Untitled"))[:180]; payload=body.get("payload",{})
+    if kind not in {"speaker","slide","template","scripture","lyric","announcement","scene"} or not isinstance(payload,dict): raise HTTPException(400,"Invalid creator record.")
+    now=utc_now()
+    with db() as con:
+        cur=con.execute("INSERT INTO creator_records(user_id,kind,title,payload,created_at,updated_at) VALUES(?,?,?,?,?,?)",(user["id"],kind,title,json.dumps(payload),now,now))
+        return record_out(con.execute("SELECT * FROM creator_records WHERE id=?",(cur.lastrowid,)).fetchone())
+
+@app.put("/api/creator/records/{rid}")
+async def update_creator_record(rid:int,request:Request):
+    user=require_user(request); body=await request.json()
+    with db() as con:
+        row=con.execute("SELECT * FROM creator_records WHERE id=? AND user_id=?",(rid,user["id"])).fetchone()
+        if not row: raise HTTPException(404,"Record not found.")
+        payload=body.get("payload",json.loads(row["payload"]))
+        con.execute("UPDATE creator_records SET title=?,payload=?,updated_at=? WHERE id=?",(str(body.get("title",row["title"]))[:180],json.dumps(payload),utc_now(),rid))
+        return record_out(con.execute("SELECT * FROM creator_records WHERE id=?",(rid,)).fetchone())
+
+@app.delete("/api/creator/records/{rid}")
+def delete_creator_record(rid:int,request:Request):
+    user=require_user(request)
+    with db() as con:
+        cur=con.execute("DELETE FROM creator_records WHERE id=? AND user_id=?",(rid,user["id"]))
+        if not cur.rowcount: raise HTTPException(404,"Record not found.")
+    return {"ok":True}
+
+@app.post("/api/media/upload")
+async def upload_media(request:Request,file:UploadFile=File(...)):
+    user=require_user(request); name=Path(file.filename or "upload.bin").name[:180]; mime=file.content_type or mimetypes.guess_type(name)[0] or "application/octet-stream"
+    allowed=("video/","image/","audio/","application/pdf","application/vnd.openxmlformats-officedocument.presentationml.presentation")
+    if not mime.startswith(allowed): raise HTTPException(415,"Upload a video, image, audio file, PDF or PPTX.")
+    data=await file.read(300*1024*1024+1)
+    if not data or len(data)>300*1024*1024: raise HTTPException(413,"File is empty or exceeds 300 MB.")
+    with db() as con:
+        cur=con.execute("INSERT INTO media_assets(user_id,name,mime_type,data,size,created_at) VALUES(?,?,?,?,?,?)",(user["id"],name,mime,data,len(data),utc_now()))
+    return {"id":cur.lastrowid,"name":name,"mime_type":mime,"size":len(data)}
+
+@app.get("/api/media")
+def list_media(request:Request):
+    user=require_user(request)
+    with db() as con: rows=con.execute("SELECT id,name,mime_type,size,created_at FROM media_assets WHERE user_id=? ORDER BY id DESC",(user["id"],)).fetchall()
+    return [dict(r) for r in rows]
+
+@app.get("/api/media/{asset_id}")
+def get_media(asset_id:int,request:Request):
+    user=require_user(request)
+    with db() as con: row=con.execute("SELECT name,mime_type,data FROM media_assets WHERE id=? AND user_id=?",(asset_id,user["id"])).fetchone()
+    if not row: raise HTTPException(404,"Media not found.")
+    return Response(row["data"],media_type=row["mime_type"],headers={"Content-Disposition":'inline; filename="'+row["name"].replace('"','')+'"'})
+
+@app.delete("/api/media/{asset_id}")
+def delete_media(asset_id:int,request:Request):
+    user=require_user(request)
+    with db() as con: cur=con.execute("DELETE FROM media_assets WHERE id=? AND user_id=?",(asset_id,user["id"]))
+    if not cur.rowcount: raise HTTPException(404,"Media not found.")
+    return {"ok":True}
+
+@app.post("/api/media/{asset_id}/trim")
+async def trim_media(asset_id:int,request:Request):
+    user=require_user(request); body=await request.json(); start=max(0,float(body.get("start",0))); end=float(body.get("end",0))
+    if end<=start or end-start>7200: raise HTTPException(400,"Invalid trim range; maximum two hours.")
+    with db() as con: row=con.execute("SELECT name,data FROM media_assets WHERE id=? AND user_id=?",(asset_id,user["id"])).fetchone()
+    if not row: raise HTTPException(404,"Source clip not found.")
+    with tempfile.TemporaryDirectory() as tmp:
+        src=Path(tmp)/"input"; out=Path(tmp)/"trimmed.mp4"; src.write_bytes(row["data"])
+        try:
+            subprocess.run(["ffmpeg","-hide_banner","-loglevel","error","-ss",str(start),"-i",str(src),"-t",str(end-start),"-map","0:v:0?","-map","0:a:0?","-c:v","libx264","-preset","veryfast","-crf","23","-c:a","aac","-movflags","+faststart","-y",str(out)],check=True,capture_output=True,timeout=900)
+        except FileNotFoundError: raise HTTPException(503,"FFmpeg is unavailable on this server.")
+        except subprocess.TimeoutExpired: raise HTTPException(504,"Clip export timed out.")
+        except subprocess.CalledProcessError as e: raise HTTPException(422,"FFmpeg could not process this clip: "+(e.stderr or b"").decode(errors="replace")[-500:])
+        data=out.read_bytes()
+    name=Path(row["name"]).stem+"_trimmed.mp4"
+    with db() as con:
+        cur=con.execute("INSERT INTO media_assets(user_id,name,mime_type,data,size,created_at) VALUES(?,?,?,?,?,?)",(user["id"],name,"video/mp4",data,len(data),utc_now()))
+    return {"ok":True,"id":cur.lastrowid,"name":name,"download_url":f"/api/media/{cur.lastrowid}"}
+
+@app.get("/overlay/live",response_class=HTMLResponse)
+def live_overlay(request:Request):
+    require_user(request)
+    return HTMLResponse("""<!doctype html><html><head><meta charset=utf-8><style>html,body{margin:0;background:transparent;color:white;font-family:Arial;overflow:hidden}#stage{position:absolute;inset:0;display:flex;align-items:flex-end;justify-content:center;padding:4vw}#box{max-width:90vw;padding:20px 34px;background:rgba(5,9,20,.78);font-size:36px;font-weight:bold;text-align:center;text-shadow:0 2px 8px #000}</style></head><body><div id=stage><div id=box></div></div><script>async function poll(){try{let j=await(await fetch('/api/creator/overlay-state')).json(),b=document.getElementById('box'),s=document.getElementById('stage');b.textContent=j.text||'';b.style.display=j.visible?'block':'none';b.style.color=j.color||'#fff';b.style.fontSize=(j.size||36)+'px';s.style.justifyContent=j.position==='left'?'flex-start':j.position==='right'?'flex-end':'center';s.style.alignItems=j.position==='top'?'flex-start':j.position==='center'?'center':'flex-end'}catch(e){}setTimeout(poll,800)}poll()</script></body></html>""")
+
+@app.get("/api/creator/overlay-state")
+def overlay_state(request:Request):
+    user=require_user(request)
+    with db() as con: row=con.execute("SELECT payload FROM creator_records WHERE user_id=? AND kind='scene' ORDER BY id DESC LIMIT 1",(user["id"],)).fetchone()
+    return json.loads(row["payload"]) if row else {"visible":False,"text":""}
+
+@app.post("/api/creator/overlay-state")
+async def set_overlay_state(request:Request):
+    user=require_user(request); b=await request.json()
+    p={"visible":bool(b.get("visible",True)),"text":str(b.get("text",""))[:4000],"position":b.get("position","bottom"),"color":b.get("color","#fff"),"size":max(14,min(100,int(b.get("size",36))))}
+    with db() as con:
+        row=con.execute("SELECT id FROM creator_records WHERE user_id=? AND kind='scene' ORDER BY id DESC LIMIT 1",(user["id"],)).fetchone()
+        if row: con.execute("UPDATE creator_records SET payload=?,updated_at=? WHERE id=?",(json.dumps(p),utc_now(),row["id"]))
+        else: con.execute("INSERT INTO creator_records(user_id,kind,title,payload,created_at,updated_at) VALUES(?,?,?,?,?,?)",(user["id"],"scene","Live overlay",json.dumps(p),utc_now(),utc_now()))
+    return {"ok":True,"state":p}
+\n@app.get("/api/config")
 def config():
     return {"google_oauth_configured": bool(CLIENT_ID and CLIENT_SECRET),
             "base_url_configured": BASE_URL != "http://localhost:10000"}

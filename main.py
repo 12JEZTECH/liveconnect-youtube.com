@@ -356,8 +356,10 @@ async def set_overlay_state(request:Request):
     user=require_user(request); b=await request.json()
     p={"visible":bool(b.get("visible",True)),"text":str(b.get("text",""))[:4000],"position":b.get("position","bottom"),"color":b.get("color","#fff"),"size":max(14,min(100,int(b.get("size",36))))}
     with db() as con:
-        row=con.execute("SELECT id FROM creator_records WHERE user_id=? AND kind='scene' ORDER BY id DESC LIMIT 1",(user["id"],)).fetchone()
-        if row: con.execute("UPDATE creator_records SET payload=?,updated_at=? WHERE id=?",(json.dumps(p),utc_now(),row["id"]))
+        row=con.execute("SELECT id,payload FROM creator_records WHERE user_id=? AND kind='scene' ORDER BY id DESC LIMIT 1",(user["id"],)).fetchone()
+        if row:
+            old=json.loads(row["payload"]); p["token"]=old.get("token")
+            con.execute("UPDATE creator_records SET payload=?,updated_at=? WHERE id=?",(json.dumps(p),utc_now(),row["id"]))
         else: con.execute("INSERT INTO creator_records(user_id,kind,title,payload,created_at,updated_at) VALUES(?,?,?,?,?,?)",(user["id"],"scene","Live overlay",json.dumps(p),utc_now(),utc_now()))
     return {"ok":True,"state":p}
 \n

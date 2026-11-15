@@ -2,20 +2,16 @@ services:
   - type: web
     name: liveconnect-youtube
     runtime: docker
-    plan: starter
+    plan: free
     region: frankfurt
     dockerfilePath: ./Dockerfile
     autoDeploy: true
     healthCheckPath: /health
-    disk:
-      name: liveconnect-data
-      mountPath: /var/data
-      sizeGB: 1
     envVars:
       - key: SECRET_KEY
         generateValue: true
       - key: DATABASE_PATH
-        value: /var/data/liveconnect.db
+        value: /tmp/liveconnect.db
       - key: GOOGLE_CLIENT_ID
         sync: false
       - key: GOOGLE_CLIENT_SECRET

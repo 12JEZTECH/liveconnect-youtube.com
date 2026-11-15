@@ -386,7 +386,8 @@ def public_overlay_state(token:str):
         saved=p.pop("token",None)
         if saved and hmac.compare_digest(saved,token): return p
     raise HTTPException(404,"Overlay token is invalid or has been rotated.")
-\n@app.get("/api/config")
+
+@app.get("/api/config")
 def config():
     return {"google_oauth_configured": bool(CLIENT_ID and CLIENT_SECRET),
             "base_url_configured": BASE_URL != "http://localhost:10000"}

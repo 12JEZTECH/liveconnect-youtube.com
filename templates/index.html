@@ -164,5 +164,9 @@ $("resetCount").onclick=()=>{stopCount();countRemaining=Math.max(0,Number($("cou
 $("showCount").onclick=()=>{window.liveOverlay={type:"countdown",time:formatCount(countRemaining),label:$("countLabel").value};refreshCount()};
 $("hideCount").onclick=()=>{if(window.liveOverlay?.type==="countdown")window.liveOverlay=null};
 ["countMinutes","countSeconds"].forEach(id=>$(id).onchange=()=>{if(!countRunning){countRemaining=Math.max(0,Number($("countMinutes").value)*60+Number($("countSeconds").value));refreshCount()}});
-refreshCount();
+refreshCount();refreshMedia();loadContentLibrary();
+async function restoreCloudCreatorRecords(){try{const rows=await apiJson("/api/creator/records");if(!speakers.length){speakers=rows.filter(x=>x.kind==="speaker").map(x=>x.payload);localStorage.setItem("liveconnect-speakers",JSON.stringify(speakers));renderSpeakers()}if(!deck.length){deck=rows.filter(x=>x.kind==="slide").reverse().map(x=>x.payload);slideIndex=deck.length?0:-1;saveDeck()}}catch(e){}}
+restoreCloudCreatorRecords();
+async function pollScheduledAnnouncements(){try{const rows=await apiJson("/api/creator/records?kind=announcement");const now=Date.now();for(const item of rows){const p=item.payload||{};if(!p.scheduled_at)continue;const at=new Date(p.scheduled_at).getTime();if(!Number.isFinite(at)||now<at)continue;const key="lc-ann-"+item.id;const last=Number(localStorage.getItem(key)||0);const repeat=Number(p.repeat||0)*60000;if(!last||(repeat>0&&now-last>=repeat)){await publishContent(item.title,p.text||"");localStorage.setItem(key,String(now));break}}}catch(e){}}
+setInterval(pollScheduledAnnouncements,5000);
 </script></body></html>

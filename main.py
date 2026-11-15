@@ -362,7 +362,7 @@ async def set_overlay_state(request:Request):
             con.execute("UPDATE creator_records SET payload=?,updated_at=? WHERE id=?",(json.dumps(p),utc_now(),row["id"]))
         else: con.execute("INSERT INTO creator_records(user_id,kind,title,payload,created_at,updated_at) VALUES(?,?,?,?,?,?)",(user["id"],"scene","Live overlay",json.dumps(p),utc_now(),utc_now()))
     return {"ok":True,"state":p}
-\n
+
 @app.get("/api/creator/overlay-url")
 def create_overlay_url(request:Request):
     user=require_user(request)

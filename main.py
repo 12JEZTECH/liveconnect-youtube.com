@@ -360,6 +360,32 @@ async def set_overlay_state(request:Request):
         if row: con.execute("UPDATE creator_records SET payload=?,updated_at=? WHERE id=?",(json.dumps(p),utc_now(),row["id"]))
         else: con.execute("INSERT INTO creator_records(user_id,kind,title,payload,created_at,updated_at) VALUES(?,?,?,?,?,?)",(user["id"],"scene","Live overlay",json.dumps(p),utc_now(),utc_now()))
     return {"ok":True,"state":p}
+\n
+@app.get("/api/creator/overlay-url")
+def create_overlay_url(request:Request):
+    user=require_user(request)
+    with db() as con:
+        row=con.execute("SELECT id,payload FROM creator_records WHERE user_id=? AND kind='scene' ORDER BY id DESC LIMIT 1",(user["id"],)).fetchone()
+        payload=json.loads(row["payload"]) if row else {"visible":False,"text":""}
+        token=payload.get("token") or secrets.token_urlsafe(32)
+        payload["token"]=token
+        now=utc_now()
+        if row: con.execute("UPDATE creator_records SET payload=?,updated_at=? WHERE id=?",(json.dumps(payload),now,row["id"]))
+        else: con.execute("INSERT INTO creator_records(user_id,kind,title,payload,created_at,updated_at) VALUES(?,?,?,?,?,?)",(user["id"],"scene","OBS overlay",json.dumps(payload),now,now))
+    return {"url":BASE_URL+"/overlay/"+token}
+
+@app.get("/overlay/{token}",response_class=HTMLResponse)
+def public_overlay(token:str):
+    return HTMLResponse("""<!doctype html><html><head><meta charset=utf-8><style>html,body{margin:0;background:transparent;color:white;font-family:Arial;overflow:hidden}#stage{position:absolute;inset:0;display:flex;align-items:flex-end;justify-content:center;padding:4vw}#box{max-width:90vw;padding:20px 34px;background:rgba(5,9,20,.78);font-size:36px;font-weight:bold;text-align:center;text-shadow:0 2px 8px #000;white-space:pre-wrap}</style></head><body><div id=stage><div id=box></div></div><script>const token="""+json.dumps(token)+""";async function poll(){try{let j=await(await fetch('/api/public/overlay-state/'+encodeURIComponent(token))).json(),b=document.getElementById('box'),s=document.getElementById('stage');b.textContent=j.text||'';b.style.display=j.visible?'block':'none';b.style.color=j.color||'#fff';b.style.fontSize=(j.size||36)+'px';s.style.justifyContent=j.position==='left'?'flex-start':j.position==='right'?'flex-end':'center';s.style.alignItems=j.position==='top'?'flex-start':j.position==='center'?'center':'flex-end'}catch(e){}setTimeout(poll,700)}poll()</script></body></html>""")
+
+@app.get("/api/public/overlay-state/{token}")
+def public_overlay_state(token:str):
+    with db() as con: rows=con.execute("SELECT payload FROM creator_records WHERE kind='scene' ORDER BY id DESC LIMIT 100").fetchall()
+    for row in rows:
+        p=json.loads(row["payload"])
+        saved=p.pop("token",None)
+        if saved and hmac.compare_digest(saved,token): return p
+    raise HTTPException(404,"Overlay token is invalid or has been rotated.")
 \n@app.get("/api/config")
 def config():
     return {"google_oauth_configured": bool(CLIENT_ID and CLIENT_SECRET),

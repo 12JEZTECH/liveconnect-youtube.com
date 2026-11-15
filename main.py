@@ -32,16 +32,7 @@ def db():
     con.execute("PRAGMA busy_timeout=20000")
     return con
 
-def         con.execute("""CREATE TABLE IF NOT EXISTS media_assets (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, name TEXT NOT NULL,
-            mime_type TEXT NOT NULL, data BLOB NOT NULL, size INTEGER NOT NULL, created_at TEXT NOT NULL,
-            FOREIGN KEY(user_id) REFERENCES users(id))""")
-        con.execute("""CREATE TABLE IF NOT EXISTS creator_records (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, kind TEXT NOT NULL,
-            title TEXT NOT NULL, payload TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-            FOREIGN KEY(user_id) REFERENCES users(id))""")
-        con.execute("CREATE INDEX IF NOT EXISTS idx_creator_user_kind ON creator_records(user_id,kind)")
-init_db():
+def init_db():
     with db() as con:
         con.execute("""CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT UNIQUE NOT NULL,
@@ -50,6 +41,16 @@ init_db():
             user_id INTEGER PRIMARY KEY, token_json TEXT NOT NULL, channel_title TEXT,
             channel_id TEXT, updated_at TEXT NOT NULL,
             FOREIGN KEY(user_id) REFERENCES users(id))""")
+        con.execute("""CREATE TABLE IF NOT EXISTS media_assets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, name TEXT NOT NULL,
+            mime_type TEXT NOT NULL, data BLOB NOT NULL, size INTEGER NOT NULL, created_at TEXT NOT NULL,
+            FOREIGN KEY(user_id) REFERENCES users(id))""")
+        con.execute("""CREATE TABLE IF NOT EXISTS creator_records (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, kind TEXT NOT NULL,
+            title TEXT NOT NULL, payload TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+            FOREIGN KEY(user_id) REFERENCES users(id))""")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_creator_user_kind ON creator_records(user_id,kind)")
+
 init_db()
 
 def hash_password(password, salt=None):

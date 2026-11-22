@@ -39,7 +39,8 @@ def init_db():
     with db() as con:
         con.execute("""CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT UNIQUE NOT NULL,
-            salt TEXT NOT NULL, password_hash TEXT NOT NULL, created_at TEXT NOT NULL)""")
+            salt TEXT NOT NULL, password_hash TEXT NOT NULL, created_at TEXT NOT NULL,
+            is_admin INTEGER NOT NULL DEFAULT 0)""")
         con.execute("""CREATE TABLE IF NOT EXISTS youtube_tokens (
             user_id INTEGER PRIMARY KEY, token_json TEXT NOT NULL, channel_title TEXT,
             channel_id TEXT, updated_at TEXT NOT NULL,
@@ -52,6 +53,22 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, kind TEXT NOT NULL,
             title TEXT NOT NULL, payload TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
             FOREIGN KEY(user_id) REFERENCES users(id))""")
+        # Safe upgrades for databases created by earlier LiveConnect releases.
+        user_cols = [r["name"] for r in con.execute("PRAGMA table_info(users)").fetchall()]
+        if "is_admin" not in user_cols:
+            con.execute("ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0")
+        con.execute("""CREATE TABLE IF NOT EXISTS subscription_payments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,
+            mpesa_code TEXT NOT NULL UNIQUE, payer_phone TEXT NOT NULL,
+            amount INTEGER NOT NULL DEFAULT 2500, status TEXT NOT NULL DEFAULT 'pending',
+            submitted_at TEXT NOT NULL, reviewed_at TEXT, reviewed_by INTEGER,
+            FOREIGN KEY(user_id) REFERENCES users(id))""")
+        con.execute("""CREATE TABLE IF NOT EXISTS subscriptions (
+            user_id INTEGER PRIMARY KEY, plan_name TEXT NOT NULL DEFAULT '3 Months',
+            amount INTEGER NOT NULL DEFAULT 2500, starts_at TEXT, expires_at TEXT,
+            status TEXT NOT NULL DEFAULT 'unpaid', updated_at TEXT NOT NULL,
+            FOREIGN KEY(user_id) REFERENCES users(id))""")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_payments_status ON subscription_payments(status)") 
         con.execute("CREATE INDEX IF NOT EXISTS idx_creator_user_kind ON creator_records(user_id,kind)")
 
 init_db()
@@ -74,6 +91,136 @@ def require_user(request):
     if not user:
         raise HTTPException(401, "Please sign in first.")
     return user
+
+ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "admin@jeztech.co.ke").strip().lower()
+SUBSCRIPTION_AMOUNT = 2500
+SUBSCRIPTION_DAYS = 90
+
+def subscription_for(user_id):
+    with db() as con:
+        row = con.execute("SELECT * FROM subscriptions WHERE user_id=?", (user_id,)).fetchone()
+    if not row:
+        return {"status":"unpaid","plan_name":"3 Months","amount":SUBSCRIPTION_AMOUNT,"expires_at":None,"days_remaining":0}
+    data = dict(row)
+    expires = data.get("expires_at")
+    active = bool(expires and datetime.fromisoformat(expires) > datetime.now(timezone.utc))
+    data["status"] = "active" if active else ("expired" if expires else data["status"])
+    data["days_remaining"] = max(0, (datetime.fromisoformat(expires)-datetime.now(timezone.utc)).days) if active else 0
+    return data
+
+def require_paid_user(request):
+    user = require_user(request)
+    sub = subscription_for(user["id"])
+    if sub["status"] != "active":
+        raise HTTPException(402, "Subscription required. Pay KSh 2,500 via Paybill 522533, account 8075755, then submit your M-Pesa confirmation code for approval.")
+    return user
+
+def require_admin(request):
+    user = require_user(request)
+    with db() as con:
+        row = con.execute("SELECT is_admin FROM users WHERE id=?", (user["id"],)).fetchone()
+    if not row or not row["is_admin"]:
+        raise HTTPException(403, "Administrator access only.")
+    return user
+
+@app.get("/api/subscription/status")
+def subscription_status(request: Request):
+    user = require_user(request)
+    sub = subscription_for(user["id"])
+    with db() as con:
+        pending = con.execute("SELECT mpesa_code,submitted_at,status FROM subscription_payments WHERE user_id=? ORDER BY id DESC LIMIT 1",(user["id"],)).fetchone()
+    return {"amount":SUBSCRIPTION_AMOUNT,"days":SUBSCRIPTION_DAYS,"paybill":"522533","account":"8075755",
+            "business":"JEZTECH Enterprises","subscription":sub,"latest_payment":dict(pending) if pending else None}
+
+@app.post("/api/billing/submit")
+async def submit_payment(request: Request):
+    user = require_user(request)
+    body = await request.json()
+    code = str(body.get("mpesa_code","")).strip().upper()
+    phone = str(body.get("phone","")).strip()
+    if not (8 <= len(code) <= 20) or not code.replace(" ","").isalnum():
+        raise HTTPException(400,"Enter a valid M-Pesa confirmation code.")
+    if len(phone) < 9 or len(phone) > 16:
+        raise HTTPException(400,"Enter the phone number used to make payment.")
+    now = utc_now()
+    try:
+        with db() as con:
+            con.execute("INSERT INTO subscription_payments(user_id,mpesa_code,payer_phone,amount,status,submitted_at) VALUES(?,?,?,?,?,?)",
+                        (user["id"],code,phone,SUBSCRIPTION_AMOUNT,"pending",now))
+    except sqlite3.IntegrityError:
+        raise HTTPException(409,"That M-Pesa confirmation code has already been submitted.")
+    return {"ok":True,"status":"pending","message":"Payment reference submitted. Access activates after JEZTECH Enterprises verifies the payment."}
+
+@app.get("/api/admin/users")
+def admin_users(request: Request):
+    require_admin(request)
+    with db() as con:
+        rows=con.execute("""SELECT u.id,u.email,u.created_at,u.is_admin,
+            s.status AS subscription_status,s.expires_at,
+            (SELECT p.mpesa_code FROM subscription_payments p WHERE p.user_id=u.id ORDER BY p.id DESC LIMIT 1) AS latest_mpesa,
+            (SELECT p.status FROM subscription_payments p WHERE p.user_id=u.id ORDER BY p.id DESC LIMIT 1) AS payment_status
+            FROM users u LEFT JOIN subscriptions s ON s.user_id=u.id ORDER BY u.id DESC""").fetchall()
+    return [dict(r) for r in rows]
+
+@app.get("/api/admin/payments")
+def admin_payments(request: Request):
+    require_admin(request)
+    with db() as con:
+        rows=con.execute("""SELECT p.*,u.email FROM subscription_payments p JOIN users u ON u.id=p.user_id
+            ORDER BY CASE p.status WHEN 'pending' THEN 0 ELSE 1 END,p.id DESC""").fetchall()
+    return [dict(r) for r in rows]
+
+@app.post("/api/admin/payments/{payment_id}/approve")
+def approve_payment(payment_id: int, request: Request):
+    admin=require_admin(request); now=datetime.now(timezone.utc)
+    with db() as con:
+        p=con.execute("SELECT * FROM subscription_payments WHERE id=?",(payment_id,)).fetchone()
+        if not p: raise HTTPException(404,"Payment not found.")
+        if p["status"]=="approved": return {"ok":True,"message":"Payment already approved."}
+        if p["status"]!="pending": raise HTTPException(409,"Only pending payments can be approved.")
+        existing=con.execute("SELECT expires_at FROM subscriptions WHERE user_id=?",(p["user_id"],)).fetchone()
+        prior=datetime.fromisoformat(existing["expires_at"]) if existing and existing["expires_at"] else now
+        start=max(now,prior); expiry=start+timedelta(days=SUBSCRIPTION_DAYS)
+        con.execute("""INSERT INTO subscriptions(user_id,plan_name,amount,starts_at,expires_at,status,updated_at)
+            VALUES(?,?,?,?,?,'active',?) ON CONFLICT(user_id) DO UPDATE SET
+            plan_name=excluded.plan_name,amount=excluded.amount,starts_at=excluded.starts_at,
+            expires_at=excluded.expires_at,status='active',updated_at=excluded.updated_at""",
+            (p["user_id"],"3 Months",SUBSCRIPTION_AMOUNT,start.isoformat(),expiry.isoformat(),now.isoformat()))
+        con.execute("UPDATE subscription_payments SET status='approved',reviewed_at=?,reviewed_by=? WHERE id=?",
+                    (now.isoformat(),admin["id"],payment_id))
+    return {"ok":True,"expires_at":expiry.isoformat()}
+
+@app.post("/api/admin/payments/{payment_id}/reject")
+def reject_payment(payment_id: int, request: Request):
+    admin=require_admin(request)
+    with db() as con:
+        cur=con.execute("UPDATE subscription_payments SET status='rejected',reviewed_at=?,reviewed_by=? WHERE id=? AND status='pending'",
+                        (utc_now(),admin["id"],payment_id))
+        if not cur.rowcount: raise HTTPException(404,"Pending payment not found.")
+    return {"ok":True}
+
+@app.post("/api/admin/users/{user_id}/reset-password")
+async def admin_reset_password(user_id: int, request: Request):
+    require_admin(request); body=await request.json(); password=str(body.get("password",""))
+    if len(password)<10: raise HTTPException(400,"Temporary password must be at least 10 characters.")
+    salt,digest=hash_password(password)
+    with db() as con:
+        cur=con.execute("UPDATE users SET salt=?,password_hash=? WHERE id=?",(salt,digest,user_id))
+        if not cur.rowcount: raise HTTPException(404,"User not found.")
+    return {"ok":True,"message":"Password reset. Share the temporary password securely with the user."}
+
+@app.post("/api/admin/users/{user_id}/subscription")
+async def admin_set_subscription(user_id: int, request: Request):
+    require_admin(request); body=await request.json(); days=int(body.get("days",90))
+    if days not in (0,30,90,180,365): raise HTTPException(400,"Choose 0, 30, 90, 180 or 365 days.")
+    with db() as con:
+        if not con.execute("SELECT id FROM users WHERE id=?",(user_id,)).fetchone(): raise HTTPException(404,"User not found.")
+        now=datetime.now(timezone.utc); expires=(now+timedelta(days=days)).isoformat() if days else None
+        con.execute("""INSERT INTO subscriptions(user_id,plan_name,amount,starts_at,expires_at,status,updated_at)
+            VALUES(?,?,?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET
+            starts_at=excluded.starts_at,expires_at=excluded.expires_at,status=excluded.status,updated_at=excluded.updated_at""",
+            (user_id,"Admin access",SUBSCRIPTION_AMOUNT,now.isoformat(),expires,"active" if days else "suspended",now.isoformat()))
+    return {"ok":True}
 
 def oauth_flow(state=None):
     if not CLIENT_ID or not CLIENT_SECRET:
@@ -120,8 +267,10 @@ def register(request: Request, email: str = Form(...), password: str = Form(...)
     salt, digest = hash_password(password)
     try:
         with db() as con:
-            cur = con.execute("INSERT INTO users(email,salt,password_hash,created_at) VALUES(?,?,?,?)",
-                              (email, salt, digest, datetime.now(timezone.utc).isoformat()))
+            cur = con.execute("INSERT INTO users(email,salt,password_hash,created_at,is_admin) VALUES(?,?,?,?,?)",
+                              (email, salt, digest, datetime.now(timezone.utc).isoformat(), 1 if email == ADMIN_EMAIL else 0))
+            con.execute("INSERT OR IGNORE INTO subscriptions(user_id,plan_name,amount,status,updated_at) VALUES(?,?,?,?,?)",
+                        (cur.lastrowid,"3 Months",SUBSCRIPTION_AMOUNT,"unpaid",utc_now()))
             request.session.clear()
             request.session["uid"] = cur.lastrowid
     except sqlite3.IntegrityError:
@@ -153,8 +302,12 @@ def me(request: Request):
         return {"signed_in": False}
     with db() as con:
         row = con.execute("SELECT channel_title,channel_id FROM youtube_tokens WHERE user_id=?", (user["id"],)).fetchone()
+    with db() as con:
+        admin_row=con.execute("SELECT is_admin FROM users WHERE id=?",(user["id"],)).fetchone()
     return {"signed_in": True, "email": user["email"], "youtube_connected": bool(row),
-            "channel_title": row["channel_title"] if row else None}
+            "channel_title": row["channel_title"] if row else None,
+            "is_admin": bool(admin_row and admin_row["is_admin"]),
+            "subscription": subscription_for(user["id"])}
 
 @app.get("/auth/google")
 def google_login(request: Request):
@@ -199,7 +352,7 @@ def channel(request: Request):
 
 @app.post("/api/youtube/broadcast")
 async def create_broadcast(request: Request):
-    user = require_user(request)
+    user = require_paid_user(request)
     body = await request.json()
     title = str(body.get("title", "LiveConnect Broadcast")).strip()[:100]
     description = str(body.get("description", "Live stream created with LiveConnect")).strip()[:5000]
@@ -248,7 +401,7 @@ async def create_broadcast(request: Request):
 
 @app.post("/api/youtube/live/start")
 async def start_browser_youtube_live(request: Request):
-    user = require_user(request)
+    user = require_paid_user(request)
     body = await request.json()
     title = str(body.get("title", "LiveConnect Browser Stream")).strip()[:100]
     privacy = body.get("privacyStatus", "unlisted")
@@ -295,6 +448,9 @@ async def youtube_stream_relay(websocket: WebSocket, broadcast_id: str):
     user_id = websocket.scope.get("session", {}).get("uid")
     if not user_id:
         await websocket.close(code=4401, reason="Sign in required")
+        return
+    if subscription_for(user_id)["status"] != "active":
+        await websocket.close(code=4402, reason="Active subscription required")
         return
     target = PENDING_LIVE_TARGETS.get((user_id, broadcast_id))
     if not target or time.time() - target["created"] > 7200:

@@ -286,6 +286,9 @@ def login(request: Request, email: str = Form(...), password: str = Form(...)):
     _, digest = hash_password(password, row["salt"])
     if not hmac.compare_digest(digest, row["password_hash"]):
         raise HTTPException(401, "Email or password is incorrect.")
+    if row["email"].strip().lower() == ADMIN_EMAIL:
+        with db() as con:
+            con.execute("UPDATE users SET is_admin=1 WHERE id=?", (row["id"],))
     request.session.clear()
     request.session["uid"] = row["id"]
     return {"ok": True, "email": row["email"]}

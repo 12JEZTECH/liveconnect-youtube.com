@@ -466,7 +466,7 @@ async def youtube_stream_relay(websocket: WebSocket, broadcast_id: str):
             "ffmpeg", "-hide_banner", "-loglevel", "warning", "-i", "pipe:0",
             "-map", "0:v:0", "-map", "0:a:0?",
             "-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency",
-            "-b:v", "2500k", "-maxrate", "3000k", "-bufsize", "5000k",
+            "-b:v", "4500k", "-maxrate", "5000k", "-bufsize", "9000k",
             "-pix_fmt", "yuv420p", "-g", "60", "-c:a", "aac", "-b:a", "128k",
             "-ar", "44100", "-f", "flv", target["rtmp"]
         ], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, bufsize=0)

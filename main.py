@@ -1,8 +1,8 @@
-import os, sqlite3, hashlib, hmac, secrets, json, subprocess, tempfile, mimetypes
+import os, sqlite3, hashlib, hmac, secrets, json, subprocess, tempfile, mimetypes, asyncio, time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from fastapi import FastAPI, Request, Form, HTTPException, UploadFile, File
+from fastapi import FastAPI, Request, Form, HTTPException, UploadFile, File, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.sessions import SessionMiddleware
@@ -23,6 +23,9 @@ CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
 SCOPES = ["openid", "https://www.googleapis.com/auth/userinfo.email", "https://www.googleapis.com/auth/youtube.force-ssl"]
 
 app = FastAPI(title="LiveConnect Creator Studio", version="1.0.0")
+
+PENDING_LIVE_TARGETS = {}
+ACTIVE_ENCODERS = {}
 app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY, same_site="lax", https_only=BASE_URL.startswith("https://"))
 
 def db():
@@ -241,6 +244,115 @@ async def create_broadcast(request: Request):
         raise
     except Exception:
         raise HTTPException(502, "YouTube could not create the broadcast. Check that live streaming is enabled for your channel, YouTube Data API v3 is enabled, and the connected Google account has the required permissions.")
+
+
+@app.post("/api/youtube/live/start")
+async def start_browser_youtube_live(request: Request):
+    user = require_user(request)
+    body = await request.json()
+    title = str(body.get("title", "LiveConnect Browser Stream")).strip()[:100]
+    privacy = body.get("privacyStatus", "unlisted")
+    description = str(body.get("description", "Live stream created with LiveConnect")).strip()[:5000]
+    if not title or privacy not in ("public", "unlisted", "private"):
+        raise HTTPException(400, "Enter a title and valid privacy status.")
+    try:
+        creds = youtube_credentials(user["id"])
+        yt = build("youtube", "v3", credentials=creds, cache_discovery=False)
+        scheduled = datetime.now(timezone.utc) + timedelta(minutes=5)
+        broadcast = yt.liveBroadcasts().insert(part="snippet,status,contentDetails", body={
+            "snippet": {"title": title, "description": description,
+                        "scheduledStartTime": scheduled.isoformat().replace("+00:00", "Z")},
+            "status": {"privacyStatus": privacy, "selfDeclaredMadeForKids": False},
+            "contentDetails": {"enableAutoStart": True, "enableAutoStop": True}
+        }).execute()
+        try:
+            stream = yt.liveStreams().insert(part="snippet,cdn,contentDetails,status", body={
+                "snippet": {"title": title + " - LiveConnect Browser Ingest"},
+                "cdn": {"ingestionType": "rtmp", "resolution": "variable", "frameRate": "variable"},
+                "contentDetails": {"isReusable": False}
+            }).execute()
+            yt.liveBroadcasts().bind(part="id,contentDetails", id=broadcast["id"], streamId=stream["id"]).execute()
+        except Exception:
+            try: yt.liveBroadcasts().delete(id=broadcast["id"]).execute()
+            except Exception: pass
+            raise
+        ingest = stream.get("cdn", {}).get("ingestionInfo", {})
+        address, key = ingest.get("ingestionAddress"), ingest.get("streamName")
+        if not address or not key: raise RuntimeError("Missing YouTube RTMP ingest details.")
+        PENDING_LIVE_TARGETS[(user["id"], broadcast["id"])] = {
+            "rtmp": address.rstrip("/") + "/" + key, "created": time.time()
+        }
+        return {"ok": True, "broadcastId": broadcast["id"], "streamId": stream["id"],
+                "watchUrl": "https://www.youtube.com/watch?v=" + broadcast["id"],
+                "websocketPath": "/ws/youtube-stream/" + broadcast["id"],
+                "scheduledStartTime": broadcast.get("snippet", {}).get("scheduledStartTime")}
+    except HTTPException: raise
+    except Exception:
+        raise HTTPException(502, "YouTube could not provision this stream. Check OAuth, live-stream eligibility and YouTube Data API v3.")
+
+@app.websocket("/ws/youtube-stream/{broadcast_id}")
+async def youtube_stream_relay(websocket: WebSocket, broadcast_id: str):
+    user_id = websocket.scope.get("session", {}).get("uid")
+    if not user_id:
+        await websocket.close(code=4401, reason="Sign in required")
+        return
+    target = PENDING_LIVE_TARGETS.get((user_id, broadcast_id))
+    if not target or time.time() - target["created"] > 7200:
+        await websocket.close(code=4404, reason="Live session missing or expired")
+        return
+    if (user_id, broadcast_id) in ACTIVE_ENCODERS:
+        await websocket.close(code=4409, reason="Encoder already active")
+        return
+    await websocket.accept()
+    ffmpeg = None
+    try:
+        ffmpeg = subprocess.Popen([
+            "ffmpeg", "-hide_banner", "-loglevel", "warning", "-i", "pipe:0",
+            "-map", "0:v:0", "-map", "0:a:0?",
+            "-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency",
+            "-b:v", "2500k", "-maxrate", "3000k", "-bufsize", "5000k",
+            "-pix_fmt", "yuv420p", "-g", "60", "-c:a", "aac", "-b:a", "128k",
+            "-ar", "44100", "-f", "flv", target["rtmp"]
+        ], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, bufsize=0)
+        ACTIVE_ENCODERS[(user_id, broadcast_id)] = ffmpeg
+        await websocket.send_json({"status": "encoder_started", "broadcastId": broadcast_id})
+        while True:
+            message = await websocket.receive()
+            if message.get("type") == "websocket.disconnect": break
+            if message.get("bytes") is not None:
+                chunk = message["bytes"]
+                if len(chunk) > 8 * 1024 * 1024:
+                    await websocket.close(code=4400, reason="Chunk too large")
+                    break
+                if ffmpeg.poll() is not None:
+                    await websocket.send_json({"status": "encoder_failed"})
+                    break
+                if ffmpeg.stdin and not ffmpeg.stdin.closed:
+                    await asyncio.to_thread(ffmpeg.stdin.write, chunk)
+            elif message.get("text"):
+                try: control = json.loads(message["text"])
+                except Exception: continue
+                if control.get("type") == "end": break
+    except WebSocketDisconnect: pass
+    except Exception:
+        try: await websocket.send_json({"status": "relay_error"})
+        except Exception: pass
+    finally:
+        ACTIVE_ENCODERS.pop((user_id, broadcast_id), None)
+        if ffmpeg:
+            try:
+                if ffmpeg.stdin and not ffmpeg.stdin.closed: ffmpeg.stdin.close()
+                try: ffmpeg.wait(timeout=12)
+                except subprocess.TimeoutExpired:
+                    ffmpeg.terminate()
+                    try: ffmpeg.wait(timeout=4)
+                    except subprocess.TimeoutExpired: ffmpeg.kill()
+            except Exception:
+                try: ffmpeg.kill()
+                except Exception: pass
+        PENDING_LIVE_TARGETS.pop((user_id, broadcast_id), None)
+        try: await websocket.close()
+        except Exception: pass
 
 @app.get("/api/youtube/broadcasts")
 def broadcasts(request: Request):

@@ -92,10 +92,72 @@ for(const [id,url] of [["register","/api/register"],["login","/api/login"]])$(id
 $("logout").onclick=async()=>{await fetch("/api/logout",{method:"POST"});await stopCamera();await refresh()};
 $("connect").onclick=()=>location.href="/auth/google";
 $("broadcast").onsubmit=async e=>{e.preventDefault();$("broadcastout").textContent="Creating broadcast with YouTube…";try{const f=new FormData(e.target);const r=await fetch("/api/youtube/broadcast",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(Object.fromEntries(f))});const j=await r.json();if(!r.ok)throw new Error(j.detail||"Could not create broadcast");$("broadcastout").innerHTML="Broadcast created. Watch URL: <a target='_blank' rel='noopener' href='"+j.watch_url+"'>Open YouTube</a><br><br>OBS Server:<br><span class='key'></span><br>Stream key:<br><span class='key'></span><br><small>Keep this key private.</small>";const spans=$("broadcastout").querySelectorAll(".key");spans[0].textContent=j.rtmp_url||"Not provided";spans[1].textContent=j.stream_key||"Not provided";}catch(err){$("broadcastout").textContent=err.message}};
-async function cameraDevices(){if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia)throw new Error("Camera access requires HTTPS (or localhost) and a supported browser.");devices=await navigator.mediaDevices.enumerateDevices();return devices.filter(d=>d.kind==="videoinput")}
-async function startCamera(){try{await stopCamera();const cams=await cameraDevices();const front=cams.find(d=>/front|user|fac(e|ing)/i.test(d.label))||cams[0];const back=cams.find(d=>d.deviceId!==front?.deviceId&&/back|rear|environment/i.test(d.label))||cams.find(d=>d.deviceId!==front?.deviceId);const selected=cams[deviceIndex%Math.max(cams.length,1)];stream=await navigator.mediaDevices.getUserMedia({video:selected?{deviceId:{exact:selected.deviceId}}:{facingMode:deviceIndex%2?"environment":"user"},audio:false});$("video").srcObject=stream;$("rearCell").classList.add("hidden");$("cameraGrid").classList.remove("dual");dualMode=false;$("both").textContent="Use both cameras";applyFilters();$("cammsg").textContent="Primary camera is active. Choose Use both cameras for dual capture. Start Program Output and capture it in OBS to include browser adjustments in your YouTube feed."}catch(e){$("cammsg").textContent="Camera error: "+e.message}}
-async function startBothCameras(){try{await stopCamera();const cams=await cameraDevices();if(cams.length<2)throw new Error("Only one camera is available to this browser/device.");const front=cams.find(d=>/front|user|fac(e|ing)/i.test(d.label))||cams[0];const back=cams.find(d=>d.deviceId!==front.deviceId&&/back|rear|environment/i.test(d.label))||cams.find(d=>d.deviceId!==front.deviceId);if(!back)throw new Error("A second camera was not detected. Switch cameras instead.");stream=await navigator.mediaDevices.getUserMedia({video:{deviceId:{exact:front.deviceId}},audio:false});try{rearStream=await navigator.mediaDevices.getUserMedia({video:{deviceId:{exact:back.deviceId}},audio:false})}catch(err){stream.getTracks().forEach(t=>t.stop());stream=null;throw new Error("This device/browser does not allow both cameras to run together. Use Switch front / back instead. "+err.message)}$("video").srcObject=stream;$("rearVideo").srcObject=rearStream;$("rearCell").classList.remove("hidden");$("cameraGrid").classList.add("dual");dualMode=true;$("both").textContent="Use one camera";applyFilters();$("cammsg").textContent="Both cameras are active. Choose Split screen or Picture in picture in Program Output, then start the program and capture it in OBS to broadcast both."}catch(e){$("cammsg").textContent="Dual camera unavailable: "+e.message}}
-async function stopCamera(){stopProgram();[stream,rearStream,micStream].forEach(s=>{if(s)s.getTracks().forEach(t=>t.stop())});stream=null;rearStream=null;micStream=null;$("video").srcObject=null;$("rearVideo").srcObject=null;$("rearCell").classList.add("hidden");$("cameraGrid").classList.remove("dual");dualMode=false;$("both").textContent="Use both cameras"}
+async function cameraDevices(){
+ if(!navigator.mediaDevices?.getUserMedia)throw new Error("Camera access requires HTTPS and a supported browser.");
+ // Request permission once so Android/Chrome reveals camera labels and device IDs.
+ let permissionStream=null;
+ try{permissionStream=await navigator.mediaDevices.getUserMedia({video:true,audio:false})}
+ catch(e){throw new Error("Allow camera permission in your browser settings, then retry. "+e.message)}
+ permissionStream.getTracks().forEach(t=>t.stop());
+ devices=await navigator.mediaDevices.enumerateDevices();
+ return devices.filter(d=>d.kind==="videoinput");
+}
+function classifyCameras(cams){
+ const front=cams.find(d=>/front|user|fac(e|ing)/i.test(d.label))||cams[0];
+ const rear=cams.find(d=>d.deviceId!==front?.deviceId&&/back|rear|environment|world/i.test(d.label))||cams.find(d=>d.deviceId!==front?.deviceId);
+ return {front,rear};
+}
+async function openCamera(device,mode){
+ const video=device?.deviceId?{deviceId:{exact:device.deviceId}}:{facingMode:{ideal:mode||"user"}};
+ return navigator.mediaDevices.getUserMedia({video:{...video,width:{ideal:1280},height:{ideal:720},frameRate:{ideal:30}},audio:false});
+}
+async function startCamera(){
+ try{
+  await stopCamera();
+  const cams=await cameraDevices();
+  if(!cams.length)throw new Error("No camera was detected.");
+  const {front,rear}=classifyCameras(cams);
+  const preferred=deviceIndex%2===0?front:rear||front;
+  stream=await openCamera(preferred,deviceIndex%2===0?"user":"environment");
+  $("video").srcObject=stream;
+  await $("video").play().catch(()=>{});
+  $("rearCell").classList.add("hidden");$("cameraGrid").classList.remove("dual");
+  dualMode=false;$("both").textContent="Use both cameras";
+  applyFilters();
+  $("cammsg").textContent="Camera active: "+(preferred?.label||"selected camera")+". Use “Use both cameras” to enable front and rear together when the device/browser supports concurrent capture.";
+ }catch(e){$("cammsg").textContent="Camera error: "+e.message}
+}
+async function startBothCameras(){
+ try{
+  await stopCamera();
+  const cams=await cameraDevices();
+  if(cams.length<2)throw new Error("Only one camera is exposed by this browser/device. On some phones, Android allows only one camera at a time.");
+  const {front,rear}=classifyCameras(cams);
+  if(!front||!rear)throw new Error("Could not identify two separate camera devices. Check browser camera permissions.");
+  stream=await openCamera(front,"user");
+  $("video").srcObject=stream;
+  await $("video").play().catch(()=>{});
+  try{
+   rearStream=await openCamera(rear,"environment");
+   $("rearVideo").srcObject=rearStream;
+   await $("rearVideo").play().catch(()=>{});
+  }catch(err){
+   stream.getTracks().forEach(t=>t.stop());stream=null;$("video").srcObject=null;
+   throw new Error("Your device/browser blocks simultaneous front and rear camera capture. Use Switch front / back instead. "+err.message);
+  }
+  $("rearCell").classList.remove("hidden");$("cameraGrid").classList.add("dual");
+  dualMode=true;$("both").textContent="Use one camera";applyFilters();
+  $("cammsg").textContent="Both cameras are running. Select Split screen or Picture in picture under Program layout to include both feeds in the broadcast.";
+ }catch(e){$("cammsg").textContent="Dual camera unavailable: "+e.message}
+}
+async function stopCamera(){
+ stopProgram();
+ [stream,rearStream,micStream].forEach(s=>{if(s)s.getTracks().forEach(t=>t.stop())});
+ stream=null;rearStream=null;micStream=null;
+ $("video").srcObject=null;$("rearVideo").srcObject=null;
+ $("rearCell").classList.add("hidden");$("cameraGrid").classList.remove("dual");
+ dualMode=false;$("both").textContent="Use both cameras";
+}
 function paintVirtualBackground(ctx,w,h,mode){
   const g=ctx.createLinearGradient(0,0,w,h);
   if(mode==="rose"){g.addColorStop(0,"#f7d5e2");g.addColorStop(.5,"#f4e5ec");g.addColorStop(1,"#d8eadb")}

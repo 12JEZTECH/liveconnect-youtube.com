@@ -250,6 +250,62 @@ def broadcasts(request: Request):
     return yt.liveBroadcasts().list(part="snippet,status", broadcastStatus="upcoming", maxResults=20).execute().get("items", [])
 
 
+
+@app.get("/api/youtube/live-chat")
+def youtube_live_chat(request: Request, page_token: str = ""):
+    user = require_user(request)
+    creds = youtube_credentials(user["id"])
+    yt = build("youtube", "v3", credentials=creds, cache_discovery=False)
+    try:
+        active = yt.liveBroadcasts().list(part="snippet,status,contentDetails",
+            broadcastStatus="active", maxResults=5).execute().get("items", [])
+        if not active:
+            return {"active": False, "messages": [], "message": "No active YouTube broadcast. Start streaming from OBS first."}
+        chat_id = active[0].get("snippet", {}).get("liveChatId")
+        if not chat_id:
+            return {"active": False, "messages": [], "message": "YouTube has not supplied a live chat for this broadcast."}
+        params = {"liveChatId": chat_id, "part": "snippet,authorDetails", "maxResults": 50}
+        if page_token:
+            params["pageToken"] = page_token
+        result = yt.liveChatMessages().list(**params).execute()
+        messages = []
+        for item in result.get("items", []):
+            snippet = item.get("snippet", {})
+            author = item.get("authorDetails", {})
+            messages.append({"id": item.get("id"), "author": author.get("displayName", "Viewer"),
+                "text": snippet.get("displayMessage", ""), "published_at": snippet.get("publishedAt", ""),
+                "type": snippet.get("type", "")})
+        return {"active": True, "messages": messages, "next_page_token": result.get("nextPageToken"),
+                "polling_interval_ms": result.get("pollingIntervalMillis", 5000)}
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(502, "Could not read YouTube Live chat. Confirm the channel is connected and an active broadcast has chat enabled.")
+
+@app.post("/api/youtube/live-chat")
+async def send_youtube_live_chat(request: Request):
+    user = require_user(request)
+    body = await request.json()
+    message = str(body.get("message", "")).strip()
+    if not message or len(message) > 200:
+        raise HTTPException(400, "Enter a chat message of 1–200 characters.")
+    creds = youtube_credentials(user["id"])
+    yt = build("youtube", "v3", credentials=creds, cache_discovery=False)
+    try:
+        active = yt.liveBroadcasts().list(part="snippet", broadcastStatus="active", maxResults=5).execute().get("items", [])
+        chat_id = active[0].get("snippet", {}).get("liveChatId") if active else None
+        if not chat_id:
+            raise HTTPException(409, "No active broadcast chat is available.")
+        result = yt.liveChatMessages().insert(part="snippet", body={
+            "snippet": {"liveChatId": chat_id, "type": "textMessageEvent",
+                        "textMessageDetails": {"messageText": message}}
+        }).execute()
+        return {"ok": True, "id": result.get("id")}
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(502, "YouTube could not send this chat message. Check channel permissions and live chat status.")
+
 def utc_now():
     return datetime.now(timezone.utc).isoformat()
 

@@ -18,7 +18,7 @@ class PgCursor:
 
 class PgConnection:
     def __init__(self, url):
-        self._con = psycopg.connect(url, row_factory=dict_row)
+        self._con = psycopg.connect(url, row_factory=dict_row, connect_timeout=5)
     def __enter__(self): return self
     def __exit__(self, exc_type, exc, tb):
         try:
@@ -32,7 +32,7 @@ class PgConnection:
         ignore = sql.lstrip().upper().startswith("INSERT OR IGNORE")
         if ignore and "ON CONFLICT" not in statement.upper():
             statement += " ON CONFLICT DO NOTHING"
-        wants_id = statement.upper().startswith("INSERT ") and "ON CONFLICT" not in statement.upper()
+        wants_id = statement.upper().startswith(("INSERT INTO USERS(", "INSERT INTO CREATOR_RECORDS(", "INSERT INTO MEDIA_ASSETS(", "INSERT INTO SUBSCRIPTION_PAYMENTS(")) and "ON CONFLICT" not in statement.upper()
         if wants_id:
             statement += " RETURNING id"
         try:
@@ -72,6 +72,15 @@ app = FastAPI(title="LiveConnect Creator Studio", version="1.0.0")
 PENDING_LIVE_TARGETS = {}
 ACTIVE_ENCODERS = {}
 app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY, same_site="lax", https_only=BASE_URL.startswith("https://"))
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    if request.url.path.startswith(("/api/", "/auth/")):
+        response.headers["Cache-Control"] = "no-store"
+    return response
 
 def db():
     if DATABASE_URL:
@@ -178,8 +187,8 @@ def subscription_for(user_id):
         return {"status":"unpaid","plan_name":"3 Months","amount":SUBSCRIPTION_AMOUNT,"expires_at":None,"days_remaining":0}
     data = dict(row)
     expires = data.get("expires_at")
-    active = bool(expires and datetime.fromisoformat(expires) > datetime.now(timezone.utc))
-    data["status"] = "active" if active else ("expired" if expires else data["status"])
+    active = bool(data["status"] != "suspended" and expires and datetime.fromisoformat(expires) > datetime.now(timezone.utc))
+    data["status"] = "suspended" if data["status"] == "suspended" else ("active" if active else ("expired" if expires else data["status"]))
     data["days_remaining"] = max(0, (datetime.fromisoformat(expires)-datetime.now(timezone.utc)).days) if active else 0
     return data
 
@@ -211,7 +220,7 @@ def subscription_status(request: Request):
 async def submit_payment(request: Request):
     user = require_user(request)
     body = await request.json()
-    code = str(body.get("mpesa_code","")).strip().upper()
+    code = "".join(str(body.get("mpesa_code","")).upper().split())
     phone = str(body.get("phone","")).strip()
     if not (8 <= len(code) <= 20) or not code.replace(" ","").isalnum():
         raise HTTPException(400,"Enter a valid M-Pesa confirmation code.")
@@ -249,10 +258,12 @@ def admin_payments(request: Request):
 def approve_payment(payment_id: int, request: Request):
     admin=require_admin(request); now=datetime.now(timezone.utc)
     with db() as con:
-        p=con.execute("SELECT * FROM subscription_payments WHERE id=?",(payment_id,)).fetchone()
+        p=con.execute("SELECT * FROM subscription_payments WHERE id=?" + (" FOR UPDATE" if DATABASE_URL else ""),(payment_id,)).fetchone()
         if not p: raise HTTPException(404,"Payment not found.")
         if p["status"]=="approved": return {"ok":True,"message":"Payment already approved."}
         if p["status"]!="pending": raise HTTPException(409,"Only pending payments can be approved.")
+        if DATABASE_URL:
+            con.execute("SELECT id FROM users WHERE id=? FOR UPDATE",(p["user_id"],)).fetchone()
         existing=con.execute("SELECT expires_at FROM subscriptions WHERE user_id=?",(p["user_id"],)).fetchone()
         prior=datetime.fromisoformat(existing["expires_at"]) if existing and existing["expires_at"] else now
         start=max(now,prior); expiry=start+timedelta(days=SUBSCRIPTION_DAYS)
@@ -328,7 +339,12 @@ def youtube_credentials(user_id):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "LiveConnect Creator Studio"}
+    try:
+        with db() as con:
+            con.execute("SELECT 1").fetchone()
+    except Exception:
+        return JSONResponse({"status":"unavailable","service":"LiveConnect Creator Studio"}, status_code=503)
+    return {"status":"ok","service":"LiveConnect Creator Studio","database":"postgresql" if DATABASE_URL else "sqlite","persistent_database":bool(DATABASE_URL)}
 
 @app.get("/", response_class=HTMLResponse)
 def home(request: Request):

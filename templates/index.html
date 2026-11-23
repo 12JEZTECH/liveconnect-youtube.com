@@ -203,13 +203,22 @@ async function startBothCameras(){
    $("rearVideo").srcObject=rearStream;
    await $("rearVideo").play().catch(()=>{});
   }catch(err){
-   stream.getTracks().forEach(t=>t.stop());stream=null;$("video").srcObject=null;
-   throw new Error("Your device/browser blocks simultaneous front and rear camera capture. Use Switch front / back instead. "+err.message);
+   // Keep the front camera alive if the second camera cannot be opened.
+   if(rearStream){rearStream.getTracks().forEach(t=>t.stop());rearStream=null}
+   $("rearVideo").srcObject=null;
+   throw new Error("The front camera is active, but this device/browser rejected the rear camera stream. "+err.message);
   }
   $("rearCell").classList.remove("hidden");$("cameraGrid").classList.add("dual");
   dualMode=true;$("both").textContent="Use one camera";applyFilters();
   $("cammsg").textContent="Both cameras are running. Select Split screen or Picture in picture under Program layout to include both feeds in the broadcast.";
- }catch(e){$("cammsg").textContent="Dual camera unavailable: "+e.message}
+ }catch(e){
+  $("rearCell").classList.add("hidden");$("cameraGrid").classList.remove("dual");
+  dualMode=false;$("both").textContent="Retry both cameras";
+  $("cammsg").textContent=stream
+   ?"Front camera remains active. Rear camera could not start: "+e.message
+   :"Dual camera unavailable: "+e.message;
+  applyFilters();
+ }
 }
 async function stopCamera(){
  stopProgram();
@@ -256,7 +265,7 @@ function stopProgram(){if(programTimer){clearInterval(programTimer);programTimer
 function setTheme(theme){document.body.dataset.theme=theme==="floral"?"floral":"studio";try{localStorage.setItem("liveconnect-theme",document.body.dataset.theme)}catch(e){}drawProgramFrame()}
 function applyFilters(){const b=$("bright").value,c=$("contrast").value,s=$("sat").value;$("video").style.filter="brightness("+b+"%) contrast("+c+"%) saturate("+s+"%)";$("video").style.transform="rotate("+rotation+"deg) scale("+primaryZoom+")";$("rearVideo").style.filter="brightness("+b+"%) contrast("+c+"%) saturate("+s+"%)";$("rearVideo").style.transform="rotate("+rotation+"deg) scale("+rearZoom+")";$("brightv").textContent=b+"%";$("contrastv").textContent=c+"%";$("satv").textContent=s+"%";$("pipXv").textContent=$("pipX").value+"%";$("pipYv").textContent=$("pipY").value+"%";drawProgramFrame()}
 $("themeSelect").onchange=e=>setTheme(e.target.value);let savedTheme="studio";try{savedTheme=localStorage.getItem("liveconnect-theme")||"studio"}catch(e){}$("themeSelect").value=savedTheme;setTheme(savedTheme);
-$("programStart").onclick=startProgram;$("programStop").onclick=stopProgram;$("programLayout").onchange=drawProgramFrame;$("zoomIn").onclick=()=>updateZoom("primary",primaryZoom+.1);$("zoomOut").onclick=()=>updateZoom("primary",primaryZoom-.1);$("zoomReset").onclick=()=>updateZoom("primary",1);$("rearZoomIn").onclick=()=>updateZoom("rear",rearZoom+.1);$("rearZoomOut").onclick=()=>updateZoom("rear",rearZoom-.1);$("rearZoomReset").onclick=()=>updateZoom("rear",1);$("zoom").oninput=e=>updateZoom("primary",e.target.value);$("rearZoom").oninput=e=>updateZoom("rear",e.target.value);["pipX","pipY"].forEach(id=>$(id).oninput=drawProgramFrame);$("backgroundTheme").onchange=e=>setBackgroundMode(e.target.value);$("start").onclick=async()=>{await startBothCameras();if(!dualMode){const dualNotice=$("cammsg").textContent;await startCamera();$("cammsg").textContent="Single-camera fallback active. Simultaneous front + rear capture was not available: "+dualNotice;}if(bgMode!=="none")await setBackgroundMode(bgMode)};$("stop").onclick=()=>{if(bgLoop){clearInterval(bgLoop);bgLoop=null}stopCamera()};$("flip").onclick=async()=>{deviceIndex++;await startCamera()};$("both").onclick=async()=>{if(dualMode)await startCamera();else await startBothCameras()};$("rotate").onclick=()=>{rotation=(rotation+90)%360;applyFilters()};["bright","contrast","sat"].forEach(id=>$(id).oninput=applyFilters);
+$("programStart").onclick=startProgram;$("programStop").onclick=stopProgram;$("programLayout").onchange=drawProgramFrame;$("zoomIn").onclick=()=>updateZoom("primary",primaryZoom+.1);$("zoomOut").onclick=()=>updateZoom("primary",primaryZoom-.1);$("zoomReset").onclick=()=>updateZoom("primary",1);$("rearZoomIn").onclick=()=>updateZoom("rear",rearZoom+.1);$("rearZoomOut").onclick=()=>updateZoom("rear",rearZoom-.1);$("rearZoomReset").onclick=()=>updateZoom("rear",1);$("zoom").oninput=e=>updateZoom("primary",e.target.value);$("rearZoom").oninput=e=>updateZoom("rear",e.target.value);["pipX","pipY"].forEach(id=>$(id).oninput=drawProgramFrame);$("backgroundTheme").onchange=e=>setBackgroundMode(e.target.value);$("start").onclick=async()=>{await startBothCameras();if(!stream)await startCamera();if(bgMode!=="none")await setBackgroundMode(bgMode)};$("stop").onclick=()=>{if(bgLoop){clearInterval(bgLoop);bgLoop=null}stopCamera()};$("flip").onclick=async()=>{deviceIndex++;await startCamera()};$("both").onclick=async()=>{if(dualMode)await startCamera();else{await startBothCameras();if(!stream)await startCamera()}};$("rotate").onclick=()=>{rotation=(rotation+90)%360;applyFilters()};["bright","contrast","sat"].forEach(id=>$(id).oninput=applyFilters);
 let sideCollapsed=false;try{sideCollapsed=localStorage.getItem("liveconnect-sidebar-collapsed")==="1"}catch(e){}const studioLayout=$("studio");function applySidebarState(){studioLayout.classList.toggle("sidebar-collapsed",sideCollapsed);$("sidebarToggle").textContent=sideCollapsed?"▶":"◀ Collapse";$("sidebarToggle").setAttribute("aria-expanded",String(!sideCollapsed));$("sidebarToggle").title=sideCollapsed?"Expand side panel":"Collapse side panel"}$("sidebarToggle").onclick=()=>{sideCollapsed=!sideCollapsed;try{localStorage.setItem("liveconnect-sidebar-collapsed",sideCollapsed?"1":"0")}catch(e){}applySidebarState()};applySidebarState();
 if(location.search.includes("youtube=connected"))history.replaceState({}, "", "/");refresh();
 

@@ -2,6 +2,50 @@ import os, sqlite3, hashlib, hmac, secrets, json, subprocess, tempfile, mimetype
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+if DATABASE_URL:
+    import psycopg
+    from psycopg.rows import dict_row
+
+class PgCursor:
+    def __init__(self, cursor):
+        self._cursor = cursor
+        self.lastrowid = None
+    @property
+    def rowcount(self): return self._cursor.rowcount
+    def fetchone(self): return self._cursor.fetchone()
+    def fetchall(self): return self._cursor.fetchall()
+
+class PgConnection:
+    def __init__(self, url):
+        self._con = psycopg.connect(url, row_factory=dict_row)
+    def __enter__(self): return self
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            if exc_type is None: self._con.commit()
+            else: self._con.rollback()
+        finally: self._con.close()
+    def execute(self, sql, params=()):
+        statement = sql.strip()
+        statement = statement.replace("INSERT OR IGNORE INTO", "INSERT INTO")
+        statement = statement.replace("?", "%s")
+        ignore = sql.lstrip().upper().startswith("INSERT OR IGNORE")
+        if ignore and "ON CONFLICT" not in statement.upper():
+            statement += " ON CONFLICT DO NOTHING"
+        wants_id = statement.upper().startswith("INSERT ") and "ON CONFLICT" not in statement.upper()
+        if wants_id:
+            statement += " RETURNING id"
+        try:
+            cur = self._con.execute(statement, params)
+        except psycopg.errors.UniqueViolation as exc:
+            raise sqlite3.IntegrityError(str(exc)) from exc
+        wrapped = PgCursor(cur)
+        if wants_id:
+            row = cur.fetchone()
+            wrapped.lastrowid = row["id"] if row else None
+        return wrapped
+
+
 from fastapi import FastAPI, Request, Form, HTTPException, UploadFile, File, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -13,7 +57,8 @@ from google.auth.transport.requests import Request as GoogleRequest
 
 APP_DIR = Path(__file__).parent
 DB_PATH = os.getenv("DATABASE_PATH", str(APP_DIR / "liveconnect.db"))
-Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
+if not DATABASE_URL:
+    Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
 SECRET_KEY = os.getenv("SECRET_KEY", "development-only-change-this-secret")
 if os.getenv("RENDER") and SECRET_KEY == "development-only-change-this-secret":
     raise RuntimeError("Set a strong SECRET_KEY in the deployment environment.")
@@ -29,6 +74,8 @@ ACTIVE_ENCODERS = {}
 app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY, same_site="lax", https_only=BASE_URL.startswith("https://"))
 
 def db():
+    if DATABASE_URL:
+        return PgConnection(DATABASE_URL)
     con = sqlite3.connect(DB_PATH, timeout=20)
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA foreign_keys=ON")
@@ -36,6 +83,35 @@ def db():
     return con
 
 def init_db():
+    if DATABASE_URL:
+        with db() as con:
+            con.execute("""CREATE TABLE IF NOT EXISTS users (
+                id BIGSERIAL PRIMARY KEY, email TEXT UNIQUE NOT NULL,
+                salt TEXT NOT NULL, password_hash TEXT NOT NULL, created_at TEXT NOT NULL,
+                is_admin INTEGER NOT NULL DEFAULT 0)""")
+            con.execute("""CREATE TABLE IF NOT EXISTS youtube_tokens (
+                user_id BIGINT PRIMARY KEY REFERENCES users(id), token_json TEXT NOT NULL,
+                channel_title TEXT, channel_id TEXT, updated_at TEXT NOT NULL)""")
+            con.execute("""CREATE TABLE IF NOT EXISTS media_assets (
+                id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL REFERENCES users(id),
+                name TEXT NOT NULL, mime_type TEXT NOT NULL, data BYTEA NOT NULL,
+                size BIGINT NOT NULL, created_at TEXT NOT NULL)""")
+            con.execute("""CREATE TABLE IF NOT EXISTS creator_records (
+                id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL REFERENCES users(id),
+                kind TEXT NOT NULL, title TEXT NOT NULL, payload TEXT NOT NULL,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL)""")
+            con.execute("""CREATE TABLE IF NOT EXISTS subscription_payments (
+                id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL REFERENCES users(id),
+                mpesa_code TEXT NOT NULL UNIQUE, payer_phone TEXT NOT NULL,
+                amount INTEGER NOT NULL DEFAULT 2500, status TEXT NOT NULL DEFAULT 'pending',
+                submitted_at TEXT NOT NULL, reviewed_at TEXT, reviewed_by BIGINT)""")
+            con.execute("""CREATE TABLE IF NOT EXISTS subscriptions (
+                user_id BIGINT PRIMARY KEY REFERENCES users(id), plan_name TEXT NOT NULL DEFAULT '3 Months',
+                amount INTEGER NOT NULL DEFAULT 2500, starts_at TEXT, expires_at TEXT,
+                status TEXT NOT NULL DEFAULT 'unpaid', updated_at TEXT NOT NULL)""")
+            con.execute("CREATE INDEX IF NOT EXISTS idx_payments_status ON subscription_payments(status)")
+            con.execute("CREATE INDEX IF NOT EXISTS idx_creator_user_kind ON creator_records(user_id,kind)")
+        return
     with db() as con:
         con.execute("""CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT UNIQUE NOT NULL,
@@ -53,7 +129,6 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, kind TEXT NOT NULL,
             title TEXT NOT NULL, payload TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
             FOREIGN KEY(user_id) REFERENCES users(id))""")
-        # Safe upgrades for databases created by earlier LiveConnect releases.
         user_cols = [r["name"] for r in con.execute("PRAGMA table_info(users)").fetchall()]
         if "is_admin" not in user_cols:
             con.execute("ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0")
@@ -68,7 +143,7 @@ def init_db():
             amount INTEGER NOT NULL DEFAULT 2500, starts_at TEXT, expires_at TEXT,
             status TEXT NOT NULL DEFAULT 'unpaid', updated_at TEXT NOT NULL,
             FOREIGN KEY(user_id) REFERENCES users(id))""")
-        con.execute("CREATE INDEX IF NOT EXISTS idx_payments_status ON subscription_payments(status)") 
+        con.execute("CREATE INDEX IF NOT EXISTS idx_payments_status ON subscription_payments(status)")
         con.execute("CREATE INDEX IF NOT EXISTS idx_creator_user_kind ON creator_records(user_id,kind)")
 
 init_db()

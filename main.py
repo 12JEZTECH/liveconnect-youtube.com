@@ -179,6 +179,7 @@ def require_user(request):
 ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "admin@jeztech.co.ke").strip().lower()
 SUBSCRIPTION_AMOUNT = 2500
 SUBSCRIPTION_DAYS = 90
+TRIAL_DAYS = 30
 
 def subscription_for(user_id):
     with db() as con:
@@ -188,14 +189,14 @@ def subscription_for(user_id):
     data = dict(row)
     expires = data.get("expires_at")
     active = bool(data["status"] != "suspended" and expires and datetime.fromisoformat(expires) > datetime.now(timezone.utc))
-    data["status"] = "suspended" if data["status"] == "suspended" else ("active" if active else ("expired" if expires else data["status"]))
-    data["days_remaining"] = max(0, (datetime.fromisoformat(expires)-datetime.now(timezone.utc)).days) if active else 0
+    data["status"] = "suspended" if data["status"] == "suspended" else (("trial" if data["status"] == "trial" else "active") if active else ("expired" if expires else data["status"]))
+    data["days_remaining"] = max(0, int(((datetime.fromisoformat(expires)-datetime.now(timezone.utc)).total_seconds()+86399)//86400)) if active else 0
     return data
 
 def require_paid_user(request):
     user = require_user(request)
     sub = subscription_for(user["id"])
-    if sub["status"] != "active":
+    if sub["status"] not in ("active", "trial"):
         raise HTTPException(402, "Subscription required. Pay KSh 2,500 via Paybill 522533, account 8075755, then submit your M-Pesa confirmation code for approval.")
     return user
 
@@ -360,8 +361,9 @@ def register(request: Request, email: str = Form(...), password: str = Form(...)
         with db() as con:
             cur = con.execute("INSERT INTO users(email,salt,password_hash,created_at,is_admin) VALUES(?,?,?,?,?)",
                               (email, salt, digest, datetime.now(timezone.utc).isoformat(), 1 if email == ADMIN_EMAIL else 0))
-            con.execute("INSERT OR IGNORE INTO subscriptions(user_id,plan_name,amount,status,updated_at) VALUES(?,?,?,?,?)",
-                        (cur.lastrowid,"3 Months",SUBSCRIPTION_AMOUNT,"unpaid",utc_now()))
+            trial_start = datetime.now(timezone.utc)
+            con.execute("INSERT INTO subscriptions(user_id,plan_name,amount,starts_at,expires_at,status,updated_at) VALUES(?,?,?,?,?,?,?)",
+                        (cur.lastrowid,"30-day free trial",0,trial_start.isoformat(),(trial_start+timedelta(days=TRIAL_DAYS)).isoformat(),"trial",trial_start.isoformat()))
             request.session.clear()
             request.session["uid"] = cur.lastrowid
     except sqlite3.IntegrityError:
@@ -543,7 +545,7 @@ async def youtube_stream_relay(websocket: WebSocket, broadcast_id: str):
     if not user_id:
         await websocket.close(code=4401, reason="Sign in required")
         return
-    if subscription_for(user_id)["status"] != "active":
+    if subscription_for(user_id)["status"] not in ("active", "trial"):
         await websocket.close(code=4402, reason="Active subscription required")
         return
     target = PENDING_LIVE_TARGETS.get((user_id, broadcast_id))

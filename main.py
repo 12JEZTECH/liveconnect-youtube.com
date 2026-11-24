@@ -813,3 +813,55 @@ def public_overlay_state(token:str):
 def config():
     return {"google_oauth_configured": bool(CLIENT_ID and CLIENT_SECRET),
             "base_url_configured": BASE_URL != "http://localhost:10000"}
+
+
+# Short-lived, private WebRTC signaling rooms; video travels peer-to-peer.
+REMOTE_CAMERA_ROOMS = {}
+
+@app.post("/api/remote-camera")
+def create_remote_camera(request: Request):
+    user = require_paid_user(request)
+    now = time.monotonic()
+    for key, room in list(REMOTE_CAMERA_ROOMS.items()):
+        if room["expires"] < now and not room["peers"]:
+            REMOTE_CAMERA_ROOMS.pop(key, None)
+    if len(REMOTE_CAMERA_ROOMS) >= 200:
+        raise HTTPException(503, "Camera pairing capacity reached.")
+    token = secrets.token_urlsafe(32)
+    REMOTE_CAMERA_ROOMS[token] = {"owner": user["id"], "expires": now + 600, "peers": {}}
+    return {"token": token}
+
+@app.websocket("/ws/remote-camera/{token}/{role}")
+async def remote_camera_signal(ws: WebSocket, token: str, role: str):
+    room = REMOTE_CAMERA_ROOMS.get(token)
+    if not room or room["expires"] < time.monotonic() or role not in ("host", "camera") or role in room["peers"]:
+        await ws.close(code=1008)
+        return
+    if role == "host" and ws.scope.get("session", {}).get("uid") != room["owner"]:
+        await ws.close(code=1008)
+        return
+    room["peers"][role] = ws
+    await ws.accept()
+    other = "camera" if role == "host" else "host"
+    try:
+        if len(room["peers"]) == 2:
+            await room["peers"]["camera"].send_json({"ready": True})
+        while True:
+            raw = await ws.receive_text()
+            if len(raw) > 65536:
+                await ws.close(code=1009)
+                break
+            peer = room["peers"].get(other)
+            if peer:
+                await peer.send_text(raw)
+    except (WebSocketDisconnect, RuntimeError):
+        pass
+    finally:
+        room["peers"].pop(role, None)
+        peer = room["peers"].pop(other, None)
+        if peer:
+            try:
+                await peer.close()
+            except RuntimeError:
+                pass
+        REMOTE_CAMERA_ROOMS.pop(token, None)

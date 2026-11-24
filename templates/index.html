@@ -166,15 +166,24 @@ function classifyCameras(cams){
  const rear=cams.find(d=>d.deviceId!==front?.deviceId&&/back|rear|environment|world/i.test(d.label))||cams.find(d=>d.deviceId!==front?.deviceId);
  return {front,rear};
 }
-async function openCamera(device,mode){
+async function openCamera(device,mode,compact=false){
  const video=device?.deviceId?{deviceId:{exact:device.deviceId}}:{facingMode:{ideal:mode||"user"}};
- const constraints={...video,width:{ideal:1920},height:{ideal:1080},frameRate:{ideal:30}};
-  try{const probe=await navigator.mediaDevices.getUserMedia({video:constraints,audio:false});const track=probe.getVideoTracks()[0],caps=track.getCapabilities?.(),settings=track.getSettings?.();const advanced=[];if(caps?.focusMode?.includes("continuous"))advanced.push({focusMode:"continuous"});if(caps?.exposureMode?.includes("continuous"))advanced.push({exposureMode:"continuous"});if(caps?.whiteBalanceMode?.includes("continuous"))advanced.push({whiteBalanceMode:"continuous"});if(advanced.length)await track.applyConstraints({advanced});probe.getTracks().forEach(t=>t.stop());}catch(e){}
-  return navigator.mediaDevices.getUserMedia({video:constraints,audio:false});
+ const constraints={...video,width:{ideal:compact?640:1920},height:{ideal:compact?480:1080},frameRate:{ideal:compact?15:30}};
+ const capture=await navigator.mediaDevices.getUserMedia({video:constraints,audio:false});
+ try{const track=capture.getVideoTracks()[0],caps=track.getCapabilities?.();const advanced=[];if(caps?.focusMode?.includes("continuous"))advanced.push({focusMode:"continuous"});if(caps?.exposureMode?.includes("continuous"))advanced.push({exposureMode:"continuous"});if(caps?.whiteBalanceMode?.includes("continuous"))advanced.push({whiteBalanceMode:"continuous"});if(advanced.length)await track.applyConstraints({advanced});}catch(e){}
+ return capture;
+}
+function releaseCameraFeeds(){
+ [stream,rearStream].forEach(s=>{if(s)s.getTracks().forEach(t=>t.stop())});
+ stream=null;rearStream=null;
+ $("video").srcObject=null;$("rearVideo").srcObject=null;
+ $("rearCell").classList.add("hidden");$("cameraGrid").classList.remove("dual");
+ dualMode=false;
 }
 async function startCamera(){
  try{
-  await stopCamera();
+  releaseCameraFeeds();
+  await new Promise(r=>setTimeout(r,350));
   const cams=await cameraDevices();
   if(!cams.length)throw new Error("No camera was detected.");
   const {front,rear}=classifyCameras(cams);
@@ -190,16 +199,18 @@ async function startCamera(){
 }
 async function startBothCameras(){
  try{
-  await stopCamera();
+  releaseCameraFeeds();
+  await new Promise(r=>setTimeout(r,350));
   const cams=await cameraDevices();
   if(cams.length<2)throw new Error("Only one camera is exposed by this browser/device. On some phones, Android allows only one camera at a time.");
   const {front,rear}=classifyCameras(cams);
   if(!front||!rear)throw new Error("Could not identify two separate camera devices. Check browser camera permissions.");
-  stream=await openCamera(front,"user");
+  deviceIndex=0;
+  stream=await openCamera(front,"user",true);
   $("video").srcObject=stream;
   await $("video").play().catch(()=>{});
   try{
-   rearStream=await openCamera(rear,"environment");
+   rearStream=await openCamera(rear,"environment",true);
    $("rearVideo").srcObject=rearStream;
    await $("rearVideo").play().catch(()=>{});
   }catch(err){
@@ -215,7 +226,7 @@ async function startBothCameras(){
   $("rearCell").classList.add("hidden");$("cameraGrid").classList.remove("dual");
   dualMode=false;$("both").textContent="Retry both cameras";
   $("cammsg").textContent=stream
-   ?"Front camera remains active. Rear camera could not start: "+e.message
+   ?"Front camera active. Simultaneous capture unavailable. Tap Flip camera to use the rear camera instead. "+e.message
    :"Dual camera unavailable: "+e.message;
   applyFilters();
  }
@@ -265,7 +276,7 @@ function stopProgram(){if(programTimer){clearInterval(programTimer);programTimer
 function setTheme(theme){document.body.dataset.theme=theme==="floral"?"floral":"studio";try{localStorage.setItem("liveconnect-theme",document.body.dataset.theme)}catch(e){}drawProgramFrame()}
 function applyFilters(){const b=$("bright").value,c=$("contrast").value,s=$("sat").value;$("video").style.filter="brightness("+b+"%) contrast("+c+"%) saturate("+s+"%)";$("video").style.transform="rotate("+rotation+"deg) scale("+primaryZoom+")";$("rearVideo").style.filter="brightness("+b+"%) contrast("+c+"%) saturate("+s+"%)";$("rearVideo").style.transform="rotate("+rotation+"deg) scale("+rearZoom+")";$("brightv").textContent=b+"%";$("contrastv").textContent=c+"%";$("satv").textContent=s+"%";$("pipXv").textContent=$("pipX").value+"%";$("pipYv").textContent=$("pipY").value+"%";drawProgramFrame()}
 $("themeSelect").onchange=e=>setTheme(e.target.value);let savedTheme="studio";try{savedTheme=localStorage.getItem("liveconnect-theme")||"studio"}catch(e){}$("themeSelect").value=savedTheme;setTheme(savedTheme);
-$("programStart").onclick=startProgram;$("programStop").onclick=stopProgram;$("programLayout").onchange=drawProgramFrame;$("zoomIn").onclick=()=>updateZoom("primary",primaryZoom+.1);$("zoomOut").onclick=()=>updateZoom("primary",primaryZoom-.1);$("zoomReset").onclick=()=>updateZoom("primary",1);$("rearZoomIn").onclick=()=>updateZoom("rear",rearZoom+.1);$("rearZoomOut").onclick=()=>updateZoom("rear",rearZoom-.1);$("rearZoomReset").onclick=()=>updateZoom("rear",1);$("zoom").oninput=e=>updateZoom("primary",e.target.value);$("rearZoom").oninput=e=>updateZoom("rear",e.target.value);["pipX","pipY"].forEach(id=>$(id).oninput=drawProgramFrame);$("backgroundTheme").onchange=e=>setBackgroundMode(e.target.value);$("start").onclick=async()=>{await startBothCameras();if(!stream)await startCamera();if(bgMode!=="none")await setBackgroundMode(bgMode)};$("stop").onclick=()=>{if(bgLoop){clearInterval(bgLoop);bgLoop=null}stopCamera()};$("flip").onclick=async()=>{deviceIndex++;await startCamera()};$("both").onclick=async()=>{if(dualMode)await startCamera();else{await startBothCameras();if(!stream)await startCamera()}};$("rotate").onclick=()=>{rotation=(rotation+90)%360;applyFilters()};["bright","contrast","sat"].forEach(id=>$(id).oninput=applyFilters);
+$("programStart").onclick=startProgram;$("programStop").onclick=stopProgram;$("programLayout").onchange=drawProgramFrame;$("zoomIn").onclick=()=>updateZoom("primary",primaryZoom+.1);$("zoomOut").onclick=()=>updateZoom("primary",primaryZoom-.1);$("zoomReset").onclick=()=>updateZoom("primary",1);$("rearZoomIn").onclick=()=>updateZoom("rear",rearZoom+.1);$("rearZoomOut").onclick=()=>updateZoom("rear",rearZoom-.1);$("rearZoomReset").onclick=()=>updateZoom("rear",1);$("zoom").oninput=e=>updateZoom("primary",e.target.value);$("rearZoom").oninput=e=>updateZoom("rear",e.target.value);["pipX","pipY"].forEach(id=>$(id).oninput=drawProgramFrame);$("backgroundTheme").onchange=e=>setBackgroundMode(e.target.value);$("start").onclick=async()=>{await startCamera();if(bgMode!=="none")await setBackgroundMode(bgMode)};$("stop").onclick=()=>{if(bgLoop){clearInterval(bgLoop);bgLoop=null}stopCamera()};$("flip").onclick=async()=>{deviceIndex++;await startCamera()};$("both").onclick=async()=>{if(dualMode)await startCamera();else{await startBothCameras();if(!stream)await startCamera()}};$("rotate").onclick=()=>{rotation=(rotation+90)%360;applyFilters()};["bright","contrast","sat"].forEach(id=>$(id).oninput=applyFilters);
 let sideCollapsed=false;try{sideCollapsed=localStorage.getItem("liveconnect-sidebar-collapsed")==="1"}catch(e){}const studioLayout=$("studio");function applySidebarState(){studioLayout.classList.toggle("sidebar-collapsed",sideCollapsed);$("sidebarToggle").textContent=sideCollapsed?"▶":"◀ Collapse";$("sidebarToggle").setAttribute("aria-expanded",String(!sideCollapsed));$("sidebarToggle").title=sideCollapsed?"Expand side panel":"Collapse side panel"}$("sidebarToggle").onclick=()=>{sideCollapsed=!sideCollapsed;try{localStorage.setItem("liveconnect-sidebar-collapsed",sideCollapsed?"1":"0")}catch(e){}applySidebarState()};applySidebarState();
 if(location.search.includes("youtube=connected"))history.replaceState({}, "", "/");refresh();
 
